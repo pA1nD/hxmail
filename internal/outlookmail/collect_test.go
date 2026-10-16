@@ -170,6 +170,10 @@ func TestVersionRuleOrder(t *testing.T) {
 	base := v(5, 100, 10)
 	resynced := v(5, 999, 99)
 	resynced.clean = false
+	samePlaceResynced := base
+	samePlaceResynced.clean = false
+	withContent := v(1, 0, 0)
+	withContent.content = true
 	ineligible := v(9, 999, 99)
 	ineligible.eligible, ineligible.clean = false, false
 	for name, tc := range map[string]struct {
@@ -179,9 +183,11 @@ func TestVersionRuleOrder(t *testing.T) {
 		"higher stamp": {v(6, 0, 0), base, true}, "lower stamp": {v(4, 999, 999), base, false},
 		"same stamp, later block": {v(5, 200, 0), base, true}, "same stamp, earlier block": {v(5, 50, 99), base, false},
 		"same block, later position": {v(5, 100, 11), base, true}, "same block, earlier position": {v(5, 100, 9), base, false},
-		"identical":                        {base, base, false},
-		"same stamp, clean beats resynced": {base, resynced, true}, "same stamp, resynced loses": {resynced, base, false},
+		"identical": {base, base, false},
+		"same stamp, resynced in a later block wins": {resynced, base, true}, "same stamp, clean in an earlier block loses": {base, resynced, false},
+		"same place, clean beats resynced": {base, samePlaceResynced, true}, "same place, resynced loses": {samePlaceResynced, base, false},
 		"eligible beats a newer ineligible": {base, ineligible, true}, "ineligible loses": {ineligible, base, false},
+		"content beats a newer empty copy": {withContent, v(9, 999, 99), true}, "empty loses to content": {v(9, 999, 99), withContent, false},
 	} {
 		if got := tc.a.newer(tc.b); got != tc.want {
 			t.Errorf("%s: %v", name, got)
@@ -496,6 +502,31 @@ func TestCollectResyncedObjectsThatMapAreKept(t *testing.T) {
 	r := collect(t, storeOf(t, append(framed(objs...), stray...)), Options{})
 	if len(r.Messages) != 1 || r.Messages[0].Copies != 2 || r.Messages[0].Subject != "newer copy" || r.Notes.ResyncedKept != 1 || r.Notes.ResyncedSkipped != 0 || len(r.Losses) != 0 || r.Doubtful {
 		t.Fatalf("%+v %+v", r.Notes, r.Losses)
+	}
+}
+
+// Outlook writes a message's body record before it has the body (an empty record, stamp 0) and
+// again, with the HTML, when the message is first displayed — that later copy is reached after
+// unknown bytes, and later syncs rewrite the empty record again. Whatever the positions, the
+// copy with the body is the one shown.
+func TestCollectBodyCopyWithContentBeatsTheEmptyOnes(t *testing.T) {
+	// the filled copy sits BEFORE a clean empty copy in a later block
+	objs := append(folderObjs(), hdr(11, 21, fInbox, 1, "opened earlier", 2), det(21, "<d@example.invalid>"),
+		hxbuild.NewMailBody(hxbuild.MailBodySpec{Key: 21, Stamp: 0, HTML: []byte("<p>fetched on open</p>")}))
+	later := framed(hxbuild.NewMailBody(hxbuild.MailBodySpec{Key: 21, Stamp: 0}))
+	r := collect(t, storeOf(t, framed(objs...), later), Options{})
+	if len(r.Messages) != 1 || r.Messages[0].Body.State != BodyInline || string(r.Messages[0].Body.HTML) != "<p>fetched on open</p>" {
+		t.Fatalf("%+v %+v", r.Messages, r.Notes)
+	}
+}
+
+func TestCollectBodyWrittenLaterBeatsTheEmptyCleanCopy(t *testing.T) {
+	objs := append(folderObjs(), hdr(11, 21, fInbox, 1, "opened later", 2), det(21, "<c@example.invalid>"),
+		hxbuild.NewMailBody(hxbuild.MailBodySpec{Key: 21, Stamp: 0}))
+	stray := append([]byte{1, 2, 3}, hxbuild.NewMailBody(hxbuild.MailBodySpec{Key: 21, Stamp: 0, HTML: []byte("<p>fetched on open</p>")}).Encode()...)
+	r := collect(t, storeOf(t, append(framed(objs...), stray...)), Options{})
+	if len(r.Messages) != 1 || r.Messages[0].Body.State != BodyInline || string(r.Messages[0].Body.HTML) != "<p>fetched on open</p>" {
+		t.Fatalf("%+v %+v", r.Messages, r.Notes)
 	}
 }
 

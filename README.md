@@ -106,7 +106,7 @@ unmodified files: `git diff --no-index upstream/internal internal` shows every c
 | Attachment byte +740 == 2 marks an inline part. A Content-ID alone does not (Gmail sets one on ordinary attachments), nor does a GUID-like name (upstream's rule) | `attachment.go` | server Inline flags |
 | Header byte +1032 is the has-attachments flag | `message.go` | server HasAttachment |
 | Only a message's newest recipient set counts: each draft save leaves an older full set behind | `collect.go` | a draft saved three times |
-| Copies of a record are ranked in one total order: a clean copy or a resynced one that repeats its key at +40 beats one that does not; then the newer change stamp; then clean over resynced. Upstream kept any clean copy over a newer resynced one, which showed stale flags | `collect.go`, tests for every read order | every mail object repeats its key |
+| Copies of a record are ranked in one total order: a clean copy or a resynced one that repeats its key at +40 beats one that does not; for a body record a copy with content beats an empty one; then the newer change stamp; then the later block; clean over resynced only at the same place. Upstream kept any clean copy over a newer resynced one, which showed stale flags, and a message's first, empty body record over the body written when the message was opened | `collect.go`, tests for every read order | every mail object repeats its key; 10 of 36 opened messages without a body on a live store |
 | Walk-coverage floor 70% (upstream 80%) | `collect.go`, test adjusted | a live store at 79.7% with every mail check passing |
 
 Also: snapshots are named `hxmail-snapshot-*` and swept by `SweepStale` (upstream relied on its

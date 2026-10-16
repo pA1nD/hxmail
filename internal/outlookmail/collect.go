@@ -127,13 +127,20 @@ type Result struct {
 // version orders the copies of one object key. An eligible copy beats one that is not: a clean
 // copy is eligible, and so is a resynced one (reached after unknown bytes) that repeats its key at
 // +40, as all 4,381 mail objects of a live 16.114 store do; a resynced copy without the repeat only
-// stands in while nothing eligible exists. Then the highest change stamp wins, a clean copy beats a
-// resynced one of the same stamp, then the highest block offset, then the later position in the
-// block. Upstream let a clean copy always win, which kept a stale header (flag none) over its newer
-// resynced copy (flag complete). The order is total, so the winner does not depend on the order in
+// stands in while nothing eligible exists. For a class whose records can be empty (a body record:
+// Outlook writes one without the body when the message arrives and fills a copy when the message
+// is first displayed; both carry stamp 0, and the empty one is rewritten in later syncs) a copy
+// with content beats one without — an empty record says nothing about the body, so it can never
+// be the newer fact. Then the highest change stamp wins, then the highest block offset, then the
+// later position in the block, and only between copies at one place a clean one beats a resynced
+// one. Upstream let a clean copy always win, which kept a stale header (flag none) over its newer
+// resynced copy (flag complete); and on a live 16.114 store, 10 of 36 messages opened in Outlook
+// still showed no body because their empty record outranked the filled one (clean before block
+// for 6, a later block for 4). The order is total, so the winner does not depend on the order in
 // which the copies are read.
 type version struct {
 	eligible bool
+	content  bool
 	stamp    uint64
 	clean    bool
 	block    int64
@@ -144,14 +151,16 @@ func (a version) newer(b version) bool {
 	switch {
 	case a.eligible != b.eligible:
 		return a.eligible
+	case a.content != b.content:
+		return a.content
 	case a.stamp != b.stamp:
 		return a.stamp > b.stamp
-	case a.clean != b.clean:
-		return a.clean
 	case a.block != b.block:
 		return a.block > b.block
+	case a.pos != b.pos:
+		return a.pos > b.pos
 	}
-	return a.pos > b.pos
+	return a.clean && !b.clean
 }
 
 // winner is the current copy of one object key, already mapped: the walk keeps what the mapper
@@ -184,6 +193,10 @@ type class[T any] struct {
 	wins map[uint32]winner[T]
 	// mapf maps an object of the class (a resynced object is kept only when it maps cleanly).
 	mapf func(hxstore.Object) (T, error)
+	// content, when set, says whether a mapped copy carries the record's content; a copy that
+	// does outranks one that does not (version.content). Every copy is then mapped, not only
+	// the ones that would win on position.
+	content func(T) bool
 }
 
 func newClass[T any](id, tag uint16, refuse bool, mapf func(hxstore.Object) (T, error)) *class[T] {
@@ -206,8 +219,9 @@ func (c *class[T]) see(o hxstore.Object, res *Result) bool {
 		// is skipped, and a header that does not map leaves the read doubtful.
 		if val, err := c.mapf(o); err == nil {
 			res.Notes.ResyncedKept++
-			if c.takes(o) {
-				c.store(o, val, nil)
+			key, v := c.versionOf(o, val)
+			if c.takes(key, v) {
+				c.wins[key] = winner[T]{v: v, val: val}
 			}
 			break
 		}
@@ -224,27 +238,36 @@ func (c *class[T]) see(o hxstore.Object, res *Result) bool {
 	return true
 }
 
-// keep records o if it is the first copy of its key or beats the copy held. A copy that loses is
-// not mapped.
+// keep records o if it is the first copy of its key or beats the copy held. A copy that loses on
+// position alone is not mapped; a class that ranks content maps every copy.
 func (c *class[T]) keep(o hxstore.Object) {
-	if !c.takes(o) {
+	key, v := keyOf(o)
+	if c.content == nil && !c.takes(key, v) {
 		return
 	}
 	val, err := c.mapf(o)
-	c.store(o, val, err)
+	if c.content != nil {
+		key, v = c.versionOf(o, val)
+		if !c.takes(key, v) {
+			return
+		}
+	}
+	c.wins[key] = winner[T]{v: v, val: val, err: err}
 }
 
-// takes says whether o would take its key.
-func (c *class[T]) takes(o hxstore.Object) bool {
-	key, v := keyOf(o)
+// takes says whether a copy of version v would take key.
+func (c *class[T]) takes(key uint32, v version) bool {
 	old, held := c.wins[key]
 	return !held || v.newer(old.v)
 }
 
-// store records the mapped copy of o, which takes its key.
-func (c *class[T]) store(o hxstore.Object, val T, err error) {
+// versionOf is keyOf with the content bit of the mapped copy, for a class that ranks content.
+func (c *class[T]) versionOf(o hxstore.Object, val T) (uint32, version) {
 	key, v := keyOf(o)
-	c.wins[key] = winner[T]{v: v, val: val, err: err}
+	if c.content != nil {
+		v.content = c.content(val)
+	}
+	return key, v
 }
 
 // keyOf is the object key and the version of one copy.
@@ -285,6 +308,7 @@ func Collect(ctx context.Context, s *hxstore.Store, root, account string, opt Op
 	headers := newClass(ClassHeader, TagHeader, true, func(o hxstore.Object) (Header, error) { return mapHeader(o) })
 	details := newClass(ClassDetail, TagDetail, true, func(o hxstore.Object) (Detail, error) { return mapDetail(o) })
 	bodies := newClass(ClassBody, TagBody, true, func(o hxstore.Object) (Body, error) { return MapBody(o), nil }) // MapBody cannot fail
+	bodies.content = func(b Body) bool { return b.State == BodyInline || b.State == BodyFile }
 	attachments := newClass(ClassAttachment, TagAttachment, false, func(o hxstore.Object) (Attachment, error) { return mapAttachment(o) })
 	folders := newClass(ClassFolder, TagFolder, false, func(o hxstore.Object) (Folder, error) { return mapFolder(o) })
 	recipients := newClass(ClassRecipient, TagRecipient, false, func(o hxstore.Object) (mappedRecipient, error) {
