@@ -10,6 +10,7 @@ attachments and, with `-body`, the body as plain text.
 ./hxmail -profile DIR     # a profile directory, required when there are several
 ./hxmail -o FILE          # write to FILE through a temporary file renamed into place
 ./hxmail -attachments DIR # copy downloaded attachments into DIR and name the copies in the output
+./hxmail -watch 2m -o FILE # keep running; export again whenever the store changes (checked every 2 min)
 ```
 
 `-o` and `-attachments` are for handing the mailbox to another program that may not open the
@@ -59,13 +60,13 @@ COPYFILE_DISABLE=1 tar -c --exclude upstream --exclude bin . | docker run --rm -
 chmod +x hxmail && codesign -s - -f hxmail
 ```
 
-macOS asks whether `hxmail` may access data from other apps (the Outlook profile) every time it
-runs — the answer to that prompt is kept for one run only for a command-line tool, whatever its
-signature or packaging (measured on macOS 15 with an ad-hoc signature, a self-signed identity and an
-app bundle alike). To run it unattended, give it Full Disk Access once: System Settings › Privacy &
-Security › Full Disk Access, add the binary (or the app bundle you wrap it in), and re-add it after a
-rebuild that changes its code signature. Running from a terminal that already has Full Disk Access
-needs nothing.
+macOS asks whether `hxmail` may access data from other apps (the Outlook profile). It asks once per
+process, whatever the binary's signature or packaging (measured on macOS 15 with an ad-hoc
+signature, a trusted self-signed identity and an app bundle alike), so a job that starts hxmail
+afresh every few minutes is asked every few minutes. Run it as one long-lived process instead —
+`hxmail -watch 2m -o FILE -attachments DIR` under launchd with `KeepAlive` — and the question comes
+once per login. Full Disk Access for the binary removes the question entirely; so does running from
+a terminal that already has it.
 
 (`COPYFILE_DISABLE=1` stops macOS tar from adding `._*` resource-fork entries, which the tests
 would otherwise read as corrupt fixtures.)

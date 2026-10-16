@@ -1,7 +1,7 @@
 // Command hxmail prints the mail held in a New Outlook for Mac store (HxStore.hxd) as JSON lines,
 // newest first. It snapshots the store before reading and never writes to the profile.
 //
-//	hxmail [-body] [-profile DIR] [-o FILE] [-attachments DIR]
+//	hxmail [-body] [-profile DIR] [-o FILE] [-attachments DIR] [-watch INTERVAL]
 //
 // Without -profile it reads the only profile under Outlook's group container and refuses to guess
 // when there are several. -o writes the output to FILE through a temporary file renamed into
@@ -9,6 +9,9 @@
 // attachment into DIR (mirroring its path under the profile's Files directory) and names the copy
 // in the output — for a consumer that may not open the Outlook profile itself. Exit status: 0 complete, 1 error, 3 output written but incomplete (the
 // reasons are on stderr).
+// -watch keeps one process running and repeats the export whenever the store file changes (checked
+// every INTERVAL): macOS asks whether hxmail may access the Outlook profile once per process, so a
+// long-lived one is asked once per login rather than on every run.
 package main
 
 import (
@@ -19,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -74,19 +78,114 @@ const exitPartial = 3
 // errPartial says the output was written but data was skipped; the reasons are already on stderr.
 var errPartial = errors.New("incomplete read")
 
+// errCopies is the errPartial of attachment copies that failed: unlike a skipped record this is
+// usually a destination to fix, so a watcher keeps trying. errors.Is(errCopies, errPartial).
+var errCopies = fmt.Errorf("%w: attachment copies failed", errPartial)
+
 func main() {
 	profile := flag.String("profile", "", "Outlook profile directory (holds HxStore.hxd)")
 	withBody := flag.Bool("body", false, "include the body as plain text")
 	outPath := flag.String("o", "", "write the output to this file (a temporary file renamed into place) instead of stdout")
 	attDir := flag.String("attachments", "", "copy downloaded attachments into this directory and name the copies in the output")
+	watch := flag.Duration("watch", 0, "keep running and export again whenever the store changes, checking at this interval (needs -o)")
 	flag.Parse()
-	err := run(*profile, *withBody, *outPath, *attDir)
+	// Ctrl-C, a closed terminal or kill cancel the read; the snapshot is removed on the way out.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+	var err error
+	if *watch > 0 {
+		err = watchLoop(ctx, *profile, *withBody, *outPath, *attDir, *watch)
+	} else {
+		err = run(ctx, *profile, *withBody, *outPath, *attDir)
+	}
 	switch {
 	case errors.Is(err, errPartial):
 		os.Exit(exitPartial)
 	case err != nil:
 		fmt.Fprintln(os.Stderr, "hxmail:", err)
 		os.Exit(1)
+	}
+}
+
+// watchLoop runs the export, then again whenever HxStore.hxd's size or modification time moved,
+// looking every interval. The profile is resolved once (symbolic links followed, as run does) and
+// must exist. A failed export is reported on stderr and tried again at the next look; an
+// incomplete one (exit status 3 otherwise) is reported and tried once more, then left until the
+// store changes — a permanent skip must not re-export every interval. A store that cannot be
+// examined is reported once per distinct error and polling continues. Ctrl-C, SIGTERM and SIGHUP
+// end the loop. Needs -o: on stdout the exports would run into each other.
+func watchLoop(ctx context.Context, profile string, withBody bool, outPath, attDir string, interval time.Duration) error {
+	if outPath == "" {
+		return errors.New("-watch needs -o FILE")
+	}
+	if profile == "" {
+		p, err := defaultProfile()
+		if err != nil {
+			return err
+		}
+		profile = p
+	}
+	resolved, err := filepath.EvalSymlinks(profile)
+	if err != nil {
+		return fmt.Errorf("profile %s: %w", profile, err)
+	}
+	profile = resolved
+	store := filepath.Join(profile, "HxStore.hxd")
+	if _, err := os.Stat(store); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: %s", outlookdesktop.ErrStoreNotFound, store)
+		}
+		return fmt.Errorf("%s: %w", store, err) // a permission problem is the usual one, and the remedy differs
+	}
+	var seen os.FileInfo // the store as last exported: size, modification time and identity
+	var lastStatErr string
+	var lastExport time.Time
+	pending := false        // an export is owed at the next look, store change or not
+	retriedPartial := false // the one extra try an incomplete export gets per store state
+	// a safety net for what the store's own change cannot show: a body file that became
+	// readable, a replaced file with identical size and time
+	const atLeastEvery = 30 * time.Minute
+	for {
+		st, err := os.Stat(store)
+		if err != nil {
+			if msg := err.Error(); msg != lastStatErr {
+				fmt.Fprintln(os.Stderr, "hxmail: watch:", err)
+				lastStatErr = msg
+			}
+		} else {
+			lastStatErr = ""
+			changed := seen == nil || st.Size() != seen.Size() || !st.ModTime().Equal(seen.ModTime()) || !os.SameFile(st, seen)
+			if changed {
+				seen = st
+				retriedPartial = false
+			}
+			if changed || pending || time.Since(lastExport) > atLeastEvery {
+				pending = false
+				lastExport = time.Now()
+				switch err := run(ctx, profile, withBody, outPath, attDir); {
+				case errors.Is(err, errCopies):
+					// a destination to fix, not a record to give up on: keep trying
+					fmt.Fprintln(os.Stderr, "hxmail: export incomplete (see above)")
+					pending = true
+				case errors.Is(err, errPartial):
+					fmt.Fprintln(os.Stderr, "hxmail: export incomplete (see above)")
+					if !retriedPartial {
+						retriedPartial = true
+						pending = true
+					}
+				case ctx.Err() != nil:
+					return nil
+				case err != nil:
+					fmt.Fprintln(os.Stderr, "hxmail:", err)
+					pending = true
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(interval):
+		}
 	}
 }
 
@@ -114,10 +213,7 @@ func defaultProfile() (string, error) {
 	return "", fmt.Errorf("several Outlook profiles, choose one with -profile:\n  %s", strings.Join(dirs, "\n  "))
 }
 
-func run(profile string, withBody bool, outPath, attDir string) error {
-	// Ctrl-C, a closed terminal or kill cancel the read; the snapshot is removed on the way out.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	defer stop()
+func run(ctx context.Context, profile string, withBody bool, outPath, attDir string) error {
 	// Copies left by runs that were killed outright (kill -9, a crash) are removed here.
 	outlookdesktop.SweepStale(time.Hour)
 	if profile == "" {
@@ -242,10 +338,13 @@ func run(profile string, withBody bool, outPath, attDir string) error {
 		fmt.Fprintf(os.Stderr, "hxmail: skipped: %d attachment copies failed (the ~/Files path is kept in the output)\n", copyFailed)
 	}
 	if err := report(res); err != nil {
+		if copyFailed > 0 {
+			return errCopies
+		}
 		return err
 	}
 	if copyFailed > 0 {
-		return errPartial
+		return errCopies
 	}
 	return nil
 }
