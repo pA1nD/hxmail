@@ -8,7 +8,15 @@ attachments and, with `-body`, the body as plain text.
 ./hxmail                  # the messages of the account in the local store
 ./hxmail -body            # plus the body as plain text
 ./hxmail -profile DIR     # a profile directory, required when there are several
+./hxmail -o FILE          # write to FILE through a temporary file renamed into place
+./hxmail -attachments DIR # copy downloaded attachments into DIR and name the copies in the output
 ```
+
+`-o` and `-attachments` are for handing the mailbox to another program that may not open the
+Outlook profile itself (macOS guards it as another app's data: a daemon that was not allowed gets
+EPERM). Run `hxmail` from launchd, allow it when macOS asks whether it may access data from other
+apps, and the consumer reads the file and the copied attachments from a folder of your choosing. An attachment whose copy fails keeps its
+`~/Files/…` path in the output and counts as a skip (exit status 3).
 
 `hxmail` copies the store into a private temporary directory, reads the copy and removes it before
 printing anything; a copy left by a run that was killed outright is removed by the next run. It
@@ -46,10 +54,13 @@ an Intel Mac:
 
 ```sh
 ARCH=arm64
-tar -c --exclude upstream --exclude bin . | docker run --rm -i -e ARCH=$ARCH golang:1.27.2 sh -c \
+COPYFILE_DISABLE=1 tar -c --exclude upstream --exclude bin . | docker run --rm -i -e ARCH=$ARCH golang:1.27.2 sh -c \
   'mkdir /src && cd /src && tar -x && go test ./... >&2 && GOOS=darwin GOARCH=$ARCH CGO_ENABLED=0 go build -trimpath -o /tmp/hxmail ./cmd/hxmail >&2 && cat /tmp/hxmail' > hxmail
 chmod +x hxmail && codesign -s - -f hxmail
 ```
+
+(`COPYFILE_DISABLE=1` stops macOS tar from adding `._*` resource-fork entries, which the tests
+would otherwise read as corrupt fixtures.)
 
 To run it as `hxmail`, move the binary into a directory on your `PATH`, for example
 `mv hxmail /usr/local/bin/`.

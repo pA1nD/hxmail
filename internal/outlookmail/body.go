@@ -145,20 +145,9 @@ var openDat = outlookdesktop.OpenReadOnly
 // must lie inside root/Files. An empty root is ErrBodyPath. A file that is gone is ErrBodyMissing; the file must start with
 // the gzip magic; an inflated size over limit is ErrBodyTooLarge.
 func ReadDat(root, path string, limit int64) ([]byte, error) {
-	rel, ok := strings.CutPrefix(path, bodyFilesPrefix)
-	if root == "" || !ok || !cleanRel(rel) {
-		return nil, ErrBodyPath
-	}
-	base, err := filepath.EvalSymlinks(filepath.Join(root, "Files"))
+	full, err := ResolveFile(root, path)
 	if err != nil {
-		return nil, fileError(err)
-	}
-	full, err := filepath.EvalSymlinks(filepath.Join(base, filepath.FromSlash(rel)))
-	if err != nil {
-		return nil, fileError(err)
-	}
-	if inside, rerr := filepath.Rel(base, full); rerr != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
-		return nil, ErrBodyPath
+		return nil, err
 	}
 	f, err := openDat(full)
 	if err != nil {
@@ -181,6 +170,29 @@ func ReadDat(root, path string, limit int64) ([]byte, error) {
 		return nil, ErrBodyTooLarge
 	}
 	return data, nil
+}
+
+// ResolveFile turns a path the store names (as ~/Files/...) into the file's absolute path under
+// root/Files, with the same checks ReadDat applies: the path must start with ~/Files/ and have
+// no backslash, colon, NUL, empty, "." or ".." element, and the file (symbolic links followed)
+// must lie inside root/Files. Used for body files and for copying attachments out.
+func ResolveFile(root, path string) (string, error) {
+	rel, ok := strings.CutPrefix(path, bodyFilesPrefix)
+	if root == "" || !ok || !cleanRel(rel) {
+		return "", ErrBodyPath
+	}
+	base, err := filepath.EvalSymlinks(filepath.Join(root, "Files"))
+	if err != nil {
+		return "", fileError(err)
+	}
+	full, err := filepath.EvalSymlinks(filepath.Join(base, filepath.FromSlash(rel)))
+	if err != nil {
+		return "", fileError(err)
+	}
+	if inside, rerr := filepath.Rel(base, full); rerr != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+		return "", ErrBodyPath
+	}
+	return full, nil
 }
 
 // fileError maps an operating system error to ErrBodyMissing for a file that is gone, and to a

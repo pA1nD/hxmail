@@ -1,10 +1,13 @@
 // Command hxmail prints the mail held in a New Outlook for Mac store (HxStore.hxd) as JSON lines,
 // newest first. It snapshots the store before reading and never writes to the profile.
 //
-//	hxmail [-body] [-profile DIR]
+//	hxmail [-body] [-profile DIR] [-o FILE] [-attachments DIR]
 //
 // Without -profile it reads the only profile under Outlook's group container and refuses to guess
-// when there are several. Exit status: 0 complete, 1 error, 3 output written but incomplete (the
+// when there are several. -o writes the output to FILE through a temporary file renamed into
+// place, so a reader never sees a half-written mailbox; -attachments copies every downloaded
+// attachment into DIR (mirroring its path under the profile's Files directory) and names the copy
+// in the output — for a consumer that may not open the Outlook profile itself. Exit status: 0 complete, 1 error, 3 output written but incomplete (the
 // reasons are on stderr).
 package main
 
@@ -14,6 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -72,8 +76,10 @@ var errPartial = errors.New("incomplete read")
 func main() {
 	profile := flag.String("profile", "", "Outlook profile directory (holds HxStore.hxd)")
 	withBody := flag.Bool("body", false, "include the body as plain text")
+	outPath := flag.String("o", "", "write the output to this file (a temporary file renamed into place) instead of stdout")
+	attDir := flag.String("attachments", "", "copy downloaded attachments into this directory and name the copies in the output")
 	flag.Parse()
-	err := run(*profile, *withBody)
+	err := run(*profile, *withBody, *outPath, *attDir)
 	switch {
 	case errors.Is(err, errPartial):
 		os.Exit(exitPartial)
@@ -107,7 +113,7 @@ func defaultProfile() (string, error) {
 	return "", fmt.Errorf("several Outlook profiles, choose one with -profile:\n  %s", strings.Join(dirs, "\n  "))
 }
 
-func run(profile string, withBody bool) error {
+func run(profile string, withBody bool, outPath, attDir string) error {
 	// Ctrl-C, a closed terminal or kill cancel the read; the snapshot is removed on the way out.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
@@ -141,6 +147,7 @@ func run(profile string, withBody bool) error {
 	}
 
 	out := make([]message, 0, len(res.Messages))
+	copyFailed := 0
 	for _, m := range res.Messages {
 		msg := message{
 			Received: m.Received, Sent: m.Sent,
@@ -173,7 +180,15 @@ func run(profile string, withBody bool) error {
 				continue
 			}
 			msg.HasAttachments = true
-			msg.Attachments = append(msg.Attachments, attachment{a.Name, a.Size, a.Downloaded, a.Path})
+			att := attachment{a.Name, a.Size, a.Downloaded, a.Path}
+			if attDir != "" && a.Downloaded && a.Path != "" {
+				if dst, err := copyAttachment(profile, attDir, a.Path); err == nil {
+					att.Path = dst
+				} else {
+					copyFailed++
+				}
+			}
+			msg.Attachments = append(msg.Attachments, att)
 		}
 		if withBody && len(m.Body.HTML) > 0 {
 			msg.Body = outlookmail.HTMLText(m.Body.HTML)
@@ -182,16 +197,106 @@ func run(profile string, withBody bool) error {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Received.After(out[j].Received) })
 
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetEscapeHTML(false)
-	for _, m := range out {
-		if err := enc.Encode(m); err != nil {
+	emit := func(w io.Writer) error {
+		enc := json.NewEncoder(w)
+		enc.SetEscapeHTML(false)
+		for _, m := range out {
+			if err := enc.Encode(m); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if outPath != "" {
+		if err := writeAtomic(outPath, emit); err != nil {
 			return err
 		}
+	} else if err := emit(os.Stdout); err != nil {
+		return err
 	}
 	fmt.Fprintf(os.Stderr, "hxmail: %d messages, %d folders; %d blocks verified of %d\n",
 		len(out), len(res.Folders), res.Stats.BlocksValid, res.Stats.BlocksFound)
-	return report(res)
+	if copyFailed > 0 {
+		fmt.Fprintf(os.Stderr, "hxmail: skipped: %d attachment copies failed (the ~/Files path is kept in the output)\n", copyFailed)
+	}
+	if err := report(res); err != nil {
+		return err
+	}
+	if copyFailed > 0 {
+		return errPartial
+	}
+	return nil
+}
+
+// writeAtomic writes what emit produces to path through a temporary file beside it, synced and
+// renamed into place, so a reader of path sees the previous complete file or the new one, never
+// a partial write. The temporary file is removed on any failure.
+func writeAtomic(path string, emit func(io.Writer) error) (err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.tmp-%d", path, os.Getpid())
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // beside the caller's own output file
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err = emit(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// copyAttachment copies the attachment file that storePath (as ~/Files/...) names under the
+// profile into dir, at the same relative path, and returns the copy's absolute path. The source
+// is resolved with the containment checks of outlookmail.ResolveFile and opened read-only; a copy
+// that already exists with the source's size is kept as is. The copy is written through a
+// temporary file renamed into place.
+func copyAttachment(profile, dir, storePath string) (string, error) {
+	src, err := outlookmail.ResolveFile(profile, storePath)
+	if err != nil {
+		return "", err
+	}
+	rel := strings.TrimPrefix(storePath, "~/Files/")
+	dst, err := filepath.Abs(filepath.Join(dir, filepath.FromSlash(rel)))
+	if err != nil {
+		return "", err
+	}
+	in, err := outlookdesktop.OpenReadOnly(src)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = in.Close() }()
+	st, err := in.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", errors.New("hxmail: attachment is not a regular file")
+	}
+	if have, err := os.Stat(dst); err == nil && have.Mode().IsRegular() && have.Size() == st.Size() {
+		return dst, nil
+	}
+	err = writeAtomic(dst, func(w io.Writer) error {
+		_, err := io.Copy(w, in)
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	return dst, nil
 }
 
 // report prints what the read skipped and returns errPartial when messages or their parts may be
