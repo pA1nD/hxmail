@@ -1,0 +1,6 @@
+{
+ "hxmail T0 bcc received": {"flag": "complete"},
+ "hxmail T1 – Größe ✓ rich": {"read": "read", "flag": "flagged"},
+ "hxmail T2 large body low importance": {"read": "unread", "folder_kind": "junk"},
+ "hxmail T3 sent roles": {"folder_kind": "sent", "to": ["{sender_address}"], "cc": ["{second_address}"], "bcc": ["{third_address}"], "has_attachments": false}
+}

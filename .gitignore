@@ -1,0 +1,10 @@
+/bin/
+validation/config.json
+validation/expected.json
+validation/out/
+/hxmail
+*.hxd
+*.hfl
+*.jsonl
+__pycache__/
+.DS_Store

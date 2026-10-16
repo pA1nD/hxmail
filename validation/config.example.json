@@ -1,0 +1,7 @@
+{
+ "outlook_address": "you@example.edu",
+ "sender_address": "sender@example.com",
+ "second_address": "second@example.com",
+ "third_address": "third@example.org",
+ "send_command": ["gws", "gmail", "users", "messages", "send"]
+}
