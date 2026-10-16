@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -126,6 +127,19 @@ func run(profile string, withBody bool, outPath, attDir string) error {
 		}
 		profile = p
 	}
+	// The profile directory is resolved once, the way the kernel resolves it (a symbolic link
+	// followed by ".." climbs from the link's target), and that one directory serves the reads
+	// and the guard below alike — filepath.Join would clean "link/.." lexically otherwise.
+	if p, err := filepath.EvalSymlinks(profile); err == nil {
+		profile = p
+	}
+	// The export flags are the only writes hxmail ever makes; none of them may land inside the
+	// Outlook profile (-o <profile>/HxStore.hxd would replace the live store with JSON). The
+	// paths are canonicalized here and those exact paths are what gets written.
+	outPath, attDir, err := exportGuard(profile, outPath, attDir)
+	if err != nil {
+		return err
+	}
 	info, cleanup, err := outlookdesktop.Snapshot(ctx, filepath.Join(profile, "HxStore.hxd"))
 	defer cleanup()
 	if err != nil {
@@ -182,8 +196,13 @@ func run(profile string, withBody bool, outPath, attDir string) error {
 			msg.HasAttachments = true
 			att := attachment{a.Name, a.Size, a.Downloaded, a.Path}
 			if attDir != "" && a.Downloaded && a.Path != "" {
-				if dst, err := copyAttachment(profile, attDir, a.Path); err == nil {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if dst, err := copyAttachment(ctx, profile, attDir, a.Path); err == nil {
 					att.Path = dst
+				} else if ctx.Err() != nil {
+					return ctx.Err()
 				} else {
 					copyFailed++
 				}
@@ -201,6 +220,9 @@ func run(profile string, withBody bool, outPath, attDir string) error {
 		enc := json.NewEncoder(w)
 		enc.SetEscapeHTML(false)
 		for _, m := range out {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if err := enc.Encode(m); err != nil {
 				return err
 			}
@@ -228,18 +250,20 @@ func run(profile string, withBody bool, outPath, attDir string) error {
 	return nil
 }
 
-// writeAtomic writes what emit produces to path through a temporary file beside it, synced and
-// renamed into place, so a reader of path sees the previous complete file or the new one, never
-// a partial write. The temporary file is removed on any failure.
+// writeAtomic writes what emit produces to path through a temporary file beside it (a short
+// random name, so a path near the filesystem's name limit still works), synced and renamed into
+// place: a reader of path sees the previous complete file or the new one, never a partial write.
+// The temporary file is removed on any failure.
 func writeAtomic(path string, emit func(io.Writer) error) (err error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp := fmt.Sprintf("%s.tmp-%d", path, os.Getpid())
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // beside the caller's own output file
+	f, err := os.CreateTemp(dir, ".hxmail-*") // 0600, O_EXCL
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	defer func() {
 		if err != nil {
 			_ = os.Remove(tmp)
@@ -259,18 +283,172 @@ func writeAtomic(path string, emit func(io.Writer) error) (err error) {
 	return os.Rename(tmp, path)
 }
 
+// canonPath resolves p the way the kernel resolves it when the entry is created: every existing
+// directory on the way is resolved, symbolic links included — so "link/.." climbs from the link's
+// target, not from the link, unlike filepath.Clean — and the entry itself is never followed. It
+// is the one form a destination takes, for the containment check and for the write alike.
+func canonPath(p string) (string, error) {
+	if !filepath.IsAbs(p) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		p = wd + string(filepath.Separator) + p
+	}
+	parts := strings.Split(p, string(filepath.Separator))
+	dir, entry := parts[:len(parts)-1], parts[len(parts)-1]
+	for n := len(dir); n >= 1; n-- {
+		prefix := strings.Join(dir[:n], string(filepath.Separator))
+		if prefix == "" {
+			prefix = string(filepath.Separator)
+		}
+		if _, err := os.Stat(prefix); err != nil {
+			continue
+		}
+		real, err := filepath.EvalSymlinks(prefix)
+		if err != nil {
+			return "", err
+		}
+		rest := append([]string{real}, dir[n:]...)
+		return filepath.Join(append(rest, entry)...), nil
+	}
+	return "", fmt.Errorf("%s: no existing directory on the way", p)
+}
+
+// exportGuard canonicalizes the export destinations and refuses any that would land inside the
+// Outlook profile. -o names a file (its directory entry is what gets written); -attachments
+// names a directory that files go below, so it is checked as the parent of a file.
+func exportGuard(profile, outPath, attDir string) (string, string, error) {
+	check := func(flag, p string) (string, error) {
+		c, err := canonPath(p)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", flag, err)
+		}
+		inside, err := insideDir(profile, c)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", flag, err)
+		}
+		if inside {
+			return "", fmt.Errorf("%s is inside the Outlook profile; hxmail never writes there", flag)
+		}
+		return c, nil
+	}
+	if outPath != "" {
+		c, err := check("-o", outPath)
+		if err != nil {
+			return "", "", err
+		}
+		outPath = c
+	}
+	if attDir != "" {
+		// not filepath.Join: it would clean a trailing ".." away before canonPath sees it
+		c, err := check("-attachments", attDir+string(filepath.Separator)+"x")
+		if err != nil {
+			return "", "", err
+		}
+		attDir = filepath.Dir(c)
+	}
+	return outPath, attDir, nil
+}
+
+// insideDir reports whether the directory entry p — which need not exist yet — would be
+// created inside dir: in dir itself or anywhere below it. It compares directory identities, not
+// path text, so a relative path, a symbolic link on the way or a differently-cased alias on a
+// case-insensitive volume all count. The entry p itself is never followed: a rename replaces the
+// entry, not what a link there points to. An error means dir or the existing part of p could not
+// be examined.
+func insideDir(dir, p string) (bool, error) {
+	base, err := os.Stat(dir)
+	if err != nil {
+		return false, err
+	}
+	if !base.IsDir() {
+		return false, fmt.Errorf("%s is not a directory", dir)
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return false, err
+	}
+	// the longest existing prefix of the entry's parent
+	exist := filepath.Dir(abs)
+	for {
+		if _, err := os.Stat(exist); err == nil {
+			break
+		}
+		parent := filepath.Dir(exist)
+		if parent == exist {
+			return false, nil
+		}
+		exist = parent
+	}
+	real, err := filepath.EvalSymlinks(exist)
+	if err != nil {
+		return false, err
+	}
+	for cur := real; ; cur = filepath.Dir(cur) {
+		if fi, err := os.Stat(cur); err == nil && os.SameFile(fi, base) {
+			return true, nil
+		}
+		if filepath.Dir(cur) == cur {
+			return false, nil
+		}
+	}
+}
+
+// ctxReader stops a copy as soon as ctx is cancelled.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+// sameContent reports whether the file at path holds exactly the bytes r yields.
+func sameContent(r io.Reader, path string) (bool, error) {
+	f, err := os.Open(path) //nolint:gosec // the caller's own export directory
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	a, b := make([]byte, 1<<16), make([]byte, 1<<16)
+	for {
+		na, ea := io.ReadFull(r, a)
+		nb, eb := io.ReadFull(f, b)
+		if ea != nil && !errors.Is(ea, io.EOF) && !errors.Is(ea, io.ErrUnexpectedEOF) {
+			return false, ea
+		}
+		if eb != nil && !errors.Is(eb, io.EOF) && !errors.Is(eb, io.ErrUnexpectedEOF) {
+			return false, eb
+		}
+		if na != nb || !bytes.Equal(a[:na], b[:nb]) {
+			return false, nil
+		}
+		if na < len(a) { // a short read is the end of both
+			return true, nil
+		}
+	}
+}
+
 // copyAttachment copies the attachment file that storePath (as ~/Files/...) names under the
 // profile into dir, at the same relative path, and returns the copy's absolute path. The source
-// is resolved with the containment checks of outlookmail.ResolveFile and opened read-only; a copy
-// that already exists with the source's size is kept as is. The copy is written through a
-// temporary file renamed into place.
-func copyAttachment(profile, dir, storePath string) (string, error) {
+// is resolved with the containment checks of outlookmail.ResolveFile and opened read-only. A
+// copy that already exists with the same bytes is kept; anything else is replaced through a
+// temporary file renamed into place. Cancelling ctx stops the copy.
+func copyAttachment(ctx context.Context, profile, dir, storePath string) (string, error) {
 	src, err := outlookmail.ResolveFile(profile, storePath)
 	if err != nil {
 		return "", err
 	}
 	rel := strings.TrimPrefix(storePath, "~/Files/")
-	dst, err := filepath.Abs(filepath.Join(dir, filepath.FromSlash(rel)))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	dst, err := canonPath(filepath.Join(dir, filepath.FromSlash(rel)))
 	if err != nil {
 		return "", err
 	}
@@ -286,11 +464,30 @@ func copyAttachment(profile, dir, storePath string) (string, error) {
 	if !st.Mode().IsRegular() {
 		return "", errors.New("hxmail: attachment is not a regular file")
 	}
-	if have, err := os.Stat(dst); err == nil && have.Mode().IsRegular() && have.Size() == st.Size() {
-		return dst, nil
+	// the destination must land below dir and outside the profile even through a symbolic link
+	// that an earlier run or someone else left inside the export directory
+	if ok, err := insideDir(dir, dst); err != nil || !ok {
+		return "", errors.New("hxmail: attachment destination leaves the export directory")
+	}
+	if in, err := insideDir(profile, dst); err != nil || in {
+		return "", errors.New("hxmail: attachment destination is inside the Outlook profile")
+	}
+	// only a regular file is reused (a link at dst — to the original, say — is replaced: the
+	// copy must stand on its own, readable without the profile)
+	if have, err := os.Lstat(dst); err == nil && have.Mode().IsRegular() && have.Size() == st.Size() {
+		same, err := sameContent(ctxReader{ctx, in}, dst)
+		if err == nil && same {
+			return dst, nil
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if _, err := in.Seek(0, io.SeekStart); err != nil {
+			return "", err
+		}
 	}
 	err = writeAtomic(dst, func(w io.Writer) error {
-		_, err := io.Copy(w, in)
+		_, err := io.Copy(w, ctxReader{ctx, in})
 		return err
 	})
 	if err != nil {
